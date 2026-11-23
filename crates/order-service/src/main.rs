@@ -7,9 +7,12 @@
 //! `KafkaConsumers.watched`).
 
 use kafka_client::supervised::ConsumerTelemetry;
-use order_service::cache::{self, CachedExamples};
+use order_service::cache::{self, History};
+use order_service::clients::{self, Inventory, Payment};
 use order_service::config::{self, Config};
-use order_service::store::PgExamples;
+use order_service::domain::OperatorAuth;
+use order_service::server::AppState;
+use order_service::store::PgOrders;
 use order_service::{consumers, lifecycle};
 use order_service::{db, server};
 use redis_cache::Cache;
@@ -85,11 +88,33 @@ async fn serve(config: &Config, tracer: SdkTracer) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let store = CachedExamples::new(PgExamples::new(pool), cache);
+    let metrics = Metrics::new(&config.service_name);
+    let client = |base_url: &str| {
+        clients::resilient(tracer.clone(), &metrics).map(|client| (base_url.to_owned(), client))
+    };
+    let (inventory, payment) = match (client(&config.inventory_url), client(&config.payment_url)) {
+        (Ok((inventory_url, inventory)), Ok((payment_url, payment))) => (
+            Inventory::new(&inventory_url, inventory),
+            Payment::new(&payment_url, payment),
+        ),
+        (Err(error), _) | (_, Err(error)) => {
+            eprintln!("{SERVICE}: can't build the HTTP client: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let store = PgOrders::new(pool);
+    let state = AppState {
+        store: store.clone(),
+        history: History::new(cache, config.history_ttl, logger.clone()),
+        inventory: inventory.clone(),
+        payment,
+        auth: OperatorAuth::new(&config.operator_token, &config.operator_id),
+        logger: logger.clone(),
+    };
     let telemetry = ConsumerTelemetry {
         tracer,
         logger: logger.clone(),
-        metrics: Metrics::new(&config.service_name),
+        metrics,
     };
     let (stop, stopped) = watch::channel(false);
     let server = {
@@ -98,13 +123,12 @@ async fn serve(config: &Config, tracer: SdkTracer) -> ExitCode {
             let until_stopped = async move {
                 let _ = stopped.wait_for(|stop| *stop).await;
             };
-            server::run(port, store, until_stopped).await
+            server::run(port, state, until_stopped).await
         }
     };
     let consumers = {
         let bootstrap = config.kafka_bootstrap.clone();
-        let logger = logger.clone();
-        async move { consumers::run(&bootstrap, logger, telemetry, stopped).await }
+        async move { consumers::run(&bootstrap, store, inventory, telemetry, stopped).await }
     };
     let signal = shutdown::signal(SERVICE);
     if lifecycle::run_until_stopped(server, consumers, signal, stop, &logger).await {

@@ -1,75 +1,98 @@
 // SPDX-License-Identifier: MIT
 
-//! Reads cached in Redis in front of the store (cache-aside, gluon-rs
-//! `redis-cache`): a found example is cached for [`TTL`]; a write deletes its
-//! key. Redis is never the source of truth: down or slow, every read goes to
-//! the store, within the cache's timeout. Replaced by the Scala service's
-//! cache (its keys and TTLs).
+//! A customer's order history cached in Redis (Scala `OrderHistoryCache`):
+//! cache-aside at [`key`] for the TTL (`ORDER_HISTORY_CACHE_TTL_SECONDS`, 60 s),
+//! TTL-only freshness (no invalidation on a write). Redis is never the source
+//! of truth: down, slow or holding something unreadable, the history comes from
+//! the store, within the cache's timeout (the Scala client hangs instead:
+//! gluon decision A13).
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use redis_cache::Cache;
+use telemetry::logging::Logger;
 
-use crate::domain::{Example, ExampleId};
-use crate::store::{Examples, StoreError};
-
-/// How long a cached example stands.
-pub const TTL: Duration = Duration::from_secs(300);
+use crate::routes::OrderResponse;
 
 /// How long a cache call may take before the store answers instead.
 pub const TIMEOUT: Duration = Duration::from_millis(500);
 
-/// The key an example is cached at.
+/// The key a customer's history is cached at (`v2`: TD-21 retired statuses
+/// older entries may hold).
 #[must_use]
-pub fn key(id: ExampleId) -> String {
-    format!("order:example:{id}")
+pub fn key(customer_id: &str) -> String {
+    format!("order-history:v2:{customer_id}")
 }
 
-/// `store`, its reads cached in `cache`.
+/// The history cache.
 #[derive(Debug, Clone)]
-pub struct CachedExamples<S> {
-    store: S,
+pub struct History {
     cache: Arc<Cache>,
+    ttl: Duration,
+    logger: Logger,
 }
 
-impl<S> CachedExamples<S> {
-    /// `store`, cached in `cache`.
-    pub fn new(store: S, cache: Arc<Cache>) -> Self {
-        Self { store, cache }
+impl History {
+    /// Histories in `cache` for `ttl`, failures logged to `logger`.
+    #[must_use]
+    pub fn new(cache: Arc<Cache>, ttl: Duration, logger: Logger) -> Self {
+        Self { cache, ttl, logger }
     }
-}
 
-/// Why a load didn't give an example to cache.
-enum Miss {
-    Absent,
-    Store(StoreError),
-}
-
-impl<S: Examples> Examples for CachedExamples<S> {
-    async fn get(&self, id: ExampleId) -> Result<Option<Example>, StoreError> {
-        let load = || async {
-            match self.store.get(id).await {
-                Ok(Some(example)) => Ok(example),
-                Ok(None) => Err(Miss::Absent),
-                Err(error) => Err(Miss::Store(error)),
+    /// The cached history, if one is there and reads; `None` otherwise (a
+    /// failure or an unreadable entry logged).
+    pub async fn get(&self, customer_id: &str) -> Option<Vec<OrderResponse>> {
+        let key = key(customer_id);
+        match self.cache.get(&key).await {
+            Ok(Some(raw)) => match serde_json::from_str(&raw) {
+                Ok(history) => Some(history),
+                Err(error) => {
+                    self.logger.warn(
+                        &[
+                            ("cache_key", &key),
+                            ("bytes", &raw.len().to_string()),
+                            ("error", &error.to_string()),
+                        ],
+                        "Discarding malformed order-history cache entry",
+                    );
+                    None
+                }
+            },
+            Ok(None) => None,
+            Err(error) => {
+                self.logger.warn(
+                    &[
+                        ("customer_id", customer_id),
+                        ("cache", "read_error"),
+                        ("error", &error.to_string()),
+                    ],
+                    "Order-history cache read failed - falling back to Postgres",
+                );
+                None
             }
-        };
-        match self.cache.get_or_load(&key(id), TTL, load).await {
-            Ok(example) => Ok(Some(example)),
-            Err(Miss::Absent) => Ok(None),
-            Err(Miss::Store(error)) => Err(error),
         }
     }
 
-    async fn insert(&self, example: &Example) -> Result<(), StoreError> {
-        self.store.insert(example).await?;
-        // A stale entry expires within the TTL if Redis is down now.
-        let _ = self.cache.delete(&[&key(example.id)]).await;
-        Ok(())
-    }
-
-    async fn ping(&self, within: Duration) -> bool {
-        self.store.ping(within).await
+    /// Caches `history` for the TTL; a failure is logged, the response unaffected.
+    pub async fn set(&self, customer_id: &str, history: &[OrderResponse]) {
+        let written = match serde_json::to_string(history) {
+            Ok(value) => self
+                .cache
+                .set(&key(customer_id), &value, self.ttl)
+                .await
+                .map_err(|error| error.to_string()),
+            Err(error) => Err(error.to_string()),
+        };
+        if let Err(error) = written {
+            self.logger.warn(
+                &[
+                    ("customer_id", customer_id),
+                    ("cache", "write_error"),
+                    ("error", &error),
+                ],
+                "Order-history cache write failed - response unaffected",
+            );
+        }
     }
 }
